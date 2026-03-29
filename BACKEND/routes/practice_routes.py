@@ -8,11 +8,8 @@ import os
 # ---------- BLUEPRINT ----------
 practice_bp = Blueprint('practice', __name__)
 
-# ---------- PRONUNCIATION MODEL ----------
-print("--- Loading Wav2Vec2 pronunciation model...")
-from models.wav2vec2_pronunciation_model import Wav2Vec2PronunciationModel
-pronunciation_model = Wav2Vec2PronunciationModel()
-print("[OK] Pronunciation model ready!")
+# ---------- PRONUNCIATION EVALUATION ----------
+from difflib import SequenceMatcher
 
 
 # ---------- PDF SENTENCE EXTRACTION ----------
@@ -215,33 +212,70 @@ def evaluate_pronunciation():
 
         audio_bytes = audio_file.read()
         
-        # 1. Use Wav2Vec2 for high-precision phoneme evaluation
-        w2v2_result = pronunciation_model.evaluate(
-            audio_bytes=audio_bytes,
-            expected_word=expected_text
-        )
-        
-        # 2. Use SpeechService for word-level alignment (missed/skipped words)
+        # Using SpeechService for transcription and scoring
         from services.speech_service import SpeechService
         speech_service = SpeechService()
         
-        # We need the transcription from SpeechService (which might use Google fallback)
-        # or we just use the w2v2 spoken_text
-        spoken_text = w2v2_result.get('spoken_text', '')
+        # We need to convert audio_bytes to an AudioData object for SpeechService
+        import speech_recognition as sr
+        audio_io = io.BytesIO(audio_bytes)
+        with sr.AudioFile(audio_io) as source:
+            audio_data = speech_service.recognizer.record(source)
+            
+        spoken_text = speech_service.transcribe(audio_data)
+        
+        if not spoken_text:
+            return jsonify({
+                "success": True,
+                "is_correct": False,
+                "score": 0.0,
+                "feedback": "Could not understand audio. Please speak clearly.",
+                "spoken_text": ""
+            })
+
+        # Calculate similarity score
+        similarity = speech_service.calculate_similarity(expected_text, spoken_text)
         word_feedback = speech_service._get_word_level_feedback(expected_text, spoken_text)
         
-        # Merge results
-        # Threshold: 0.55 is more forgiving for learning
-        is_correct = w2v2_result.get('score', 0) >= 0.55 or w2v2_result.get('status') in ['correct', 'almost']
+        # Threshold: 0.6 is good for learning
+        is_correct = similarity >= 0.6
         
+        # Generate friendly, encouraging feedback
+        if is_correct:
+            if similarity >= 0.95:
+                feedback = f"🎉 Perfect! Excellent pronunciation!"
+            elif similarity >= 0.85:
+                feedback = f"✨ Great job! Very close to perfect!"
+            else:
+                feedback = f"👏 Good effort! You're making progress!"
+        else:
+            # Count the errors by type
+            mispronounced = sum(1 for w in word_feedback if w.get('status') == 'mispronounced')
+            missed = sum(1 for w in word_feedback if w.get('status') == 'missed')
+            article_errors = sum(1 for w in word_feedback if w.get('status') == 'article-error')
+            
+            feedback_parts = []
+            if similarity >= 0.4:
+                feedback_parts.append("Nice try! Keep working on these words:")
+            else:
+                feedback_parts.append("Let's focus on these words:")
+            
+            if article_errors > 0:
+                feedback_parts.append(f"• {article_errors} article word(s) (a/an/the) - watch your grammar!")
+            if mispronounced > 0:
+                feedback_parts.append(f"• {mispronounced} word(s) need clearer pronunciation")
+            if missed > 0:
+                feedback_parts.append(f"• {missed} word(s) were skipped")
+                
+            feedback = " ".join(feedback_parts)
+
         return jsonify({
             "success": True,
             "is_correct": is_correct,
-            "score": w2v2_result.get('score'),
-            "feedback": w2v2_result.get('feedback'),
+            "score": round(similarity, 2),
+            "feedback": feedback,
             "word_feedback": word_feedback,
-            "spoken_text": w2v2_result.get('spoken_text'),
-            "result": w2v2_result 
+            "spoken_text": spoken_text
         })
 
     except Exception as e:

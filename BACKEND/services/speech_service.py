@@ -8,38 +8,15 @@ import PyPDF2
 import io
 import uuid
 from config import Config
-import torch
-import numpy as np
-from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-
 # ==========================================
-# 0. GLOBAL MODEL LOADING (SINGLETON PATTERN)
+# 0. TTS & SPEECH UTILS
 # ==========================================
-# Global model instance
-_wav2vec2_processor = None
-_wav2vec2_model = None
-
-def load_wav2vec2_model():
-    global _wav2vec2_processor, _wav2vec2_model
-    if _wav2vec2_model is None:
-        try:
-            print("[INIT] Loading Wav2Vec2 model...")
-            from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-            _wav2vec2_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-            _wav2vec2_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")
-            print("[INIT] Wav2Vec2 model loaded successfully")
-        except Exception as e:
-            print(f"[ERROR] Failed to load Wav2Vec2: {e}")
 
 class SpeechService:
     # ==========================================
     # 1. INITIALIZATION & SETUP
     # ==========================================
     def __init__(self):
-        # Initialize model if not already loaded
-        if _wav2vec2_model is None:
-            load_wav2vec2_model()
-            
         self.engine = self._init_tts()
         self.recognizer = sr.Recognizer()
         self._configure_recognizer()
@@ -50,10 +27,6 @@ class SpeechService:
         self.total_practiced = 0
         self.is_reading = False
         self.current_pdf = None
-        
-        # Use global instances
-        self.processor = _wav2vec2_processor
-        self.model = _wav2vec2_model
     
     def _init_tts(self):
         """Initialize text-to-speech engine"""
@@ -247,8 +220,21 @@ class SpeechService:
                 'mode': 'error'
             }
 
+    def _has_word_errors(self, word_feedback):
+        """Check if there are any word-level errors in the feedback"""
+        if not word_feedback:
+            return False
+        
+        # Check if any word has an error status
+        error_statuses = {'mispronounced', 'missed', 'article-error'}
+        for feedback_item in word_feedback:
+            if feedback_item.get('status') in error_statuses:
+                return True
+        
+        return False
+
     def practice_current_sentence(self):
-        """Practice the current sentence with immediate feedback"""
+        """Practice the current sentence with strict word-level accuracy requirement"""
         if not self.sentences or self.current_sentence_index >= len(self.sentences):
             return {
                 'success': False,
@@ -265,14 +251,22 @@ class SpeechService:
             
             if result.get('success'):
                 self.total_practiced += 1
-                if result.get('is_correct'):
+                
+                # Check for word-level errors - if any word is mispronounced, don't advance
+                word_feedback = result.get('word_feedback', [])
+                has_errors = self._has_word_errors(word_feedback)
+                
+                if not has_errors:
+                    # All words are correct - advance to next sentence
                     self.correct_count += 1
                     self.current_sentence_index += 1
-                    result['message'] = "[OK] Correct! Moving to next sentence."
+                    result['message'] = "[OK] Perfect! All words pronounced correctly. Moving to next sentence."
                     result['next_sentence_available'] = self.current_sentence_index < len(self.sentences)
                 else:
-                    result['message'] = "[X] Try again! Listen carefully."
+                    # At least one word is mispronounced - stay on same sentence
+                    result['message'] = "Try again, you're so close! Focus on the words that sound different."
                     result['next_sentence_available'] = self.current_sentence_index < len(self.sentences)
+                    result['should_retry'] = True
                 
                 # Add session stats
                 accuracy = (self.correct_count / self.total_practiced) * 100 if self.total_practiced > 0 else 0
@@ -287,8 +281,8 @@ class SpeechService:
 
         except Exception as e:
             # Fallback for outer exception
-             print(f"[ERROR] Session practice error: {e}")
-             return {
+            print(f"[ERROR] Session practice error: {e}")
+            return {
                 'success': False,
                 'error': str(e),
                 'spoken_text': None,
@@ -375,15 +369,35 @@ class SpeechService:
     # ==========================================
     # 7. LOW-LEVEL AUDIO IO
     # ==========================================
+    def _remove_reading_symbols(self, text):
+        """Remove symbols that shouldn't be read aloud
+        
+        Removes: /, ,, ., ?, !, ;, :, -, (, ), [, ], {, }, ", ', |, ~, `, @, #, $, %, ^, &, * etc.
+        But keeps the text structure for natural reading flow
+        """
+        # Replace common punctuation with space to preserve word boundaries
+        symbols_to_remove = r'[/,.\?!;:\-\(\)\[\]\{\}"\'\|~`@#$%^&*+=<>\\]'
+        cleaned = re.sub(symbols_to_remove, ' ', text)
+        
+        # Remove extra spaces created by symbol removal
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        
+        return cleaned
+    
     def speak(self, text):
         """Speak text using TTS"""
         if self.engine is None:
             print(f"TTS Simulation: {text}")
             return
-            
+        
         try:
-            self.engine.say(text)
-            self.engine.runAndWait()
+            # Remove symbols before speaking
+            clean_text = self._remove_reading_symbols(text)
+            
+            # Only speak if there's meaningful content after cleaning
+            if clean_text:
+                self.engine.say(clean_text)
+                self.engine.runAndWait()
             time.sleep(0.3)
         except Exception as e:
             print(f"TTS Error: {e}")
@@ -433,48 +447,21 @@ class SpeechService:
             raise RuntimeError(f"Microphone error: {e}")
     
     def transcribe(self, audio):
-        """Convert speech to text using Wav2Vec2"""
-        if self.model and self.processor:
-            try:
-                # Get raw data at 16kHz
-                raw_data = audio.get_raw_data(convert_rate=16000, convert_width=2)
-                # Convert to numpy array (int16) -> float32
-                input_values = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32)
-                # Normalize (16-bit PCM)
-                input_values = input_values / 32768.0
-                
-                # Tokenize
-                input_values = self.processor(input_values, return_tensors="pt", sampling_rate=16000).input_values
-                
-                # Inference
-                with torch.no_grad():
-                    logits = self.model(input_values).logits
-                
-                # Decode
-                predicted_ids = torch.argmax(logits, dim=-1)
-                transcription = self.processor.batch_decode(predicted_ids)[0]
-                
-                print(f"[TRANSCRIPTION-W2V2] '{transcription}'")
-                return transcription.lower()
-                
-            except Exception as e:
-                print(f"[ERROR] Wav2Vec2 Inference error: {e}")
-                # Fallback to Google if inference fails
-                try:
-                    text = self.recognizer.recognize_google(audio)
-                    print(f"[TRANSCRIPTION-GOOGLE] '{text}'")
-                    return text.lower()
-                except Exception as e_google:
-                     raise RuntimeError(f"Speech recognition service error: {e} | {e_google}")
-        else:
-             # Fallback to Google if model failed to load
-             try:
-                text = self.recognizer.recognize_google(audio)
-                return text.lower()
-             except sr.UnknownValueError:
-                raise RuntimeError("Could not understand the audio")
-             except sr.RequestError as e:
-                raise RuntimeError(f"Speech recognition service error: {e}")
+        """Convert speech to text using Google Speech Recognition"""
+        try:
+            # Using Google Speech Recognition fallback (reliable and lightweight)
+            text = self.recognizer.recognize_google(audio)
+            print(f"[TRANSCRIPTION-GOOGLE] '{text}'")
+            return text.lower()
+        except sr.UnknownValueError:
+            print("[ERROR] Google Speech Recognition could not understand the audio")
+            return ""
+        except sr.RequestError as e:
+            print(f"[ERROR] Google Speech Recognition service error: {e}")
+            return ""
+        except Exception as e:
+            print(f"[ERROR] Transcription failed: {e}")
+            return ""
     
     def calculate_similarity(self, original, spoken):
         """Calculate similarity between original and spoken text"""
@@ -506,21 +493,34 @@ class SpeechService:
         matcher = SequenceMatcher(None, clean_orig, clean_spoken)
         feedback = []
         
+        # Articles that need careful checking
+        articles = {'a', 'an', 'the'}
+        
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag == 'equal':
                 for i in range(i1, i2):
                     feedback.append({'word': orig_words[i], 'status': 'correct'})
             elif tag == 'replace':
                 for i in range(i1, i2):
-                    # Check for mispronunciation
                     spoken_idx = j1 + (i - i1)
                     if spoken_idx < j2:
-                        sim = SequenceMatcher(None, clean_orig[i], clean_spoken[spoken_idx]).ratio()
-                        if sim > 0.6:
-                            feedback.append({'word': orig_words[i], 'status': 'mispronounced'})
+                        # Check if this is an article error (e.g., "a" vs "an")
+                        orig_lower = clean_orig[i]
+                        spoken_lower = clean_spoken[spoken_idx]
+                        
+                        if orig_lower in articles and spoken_lower in articles:
+                            # Article/grammar error - needs correction
+                            feedback.append({
+                                'word': orig_words[i], 
+                                'status': 'article-error',
+                                'spoken': spoken_words[spoken_idx],
+                                'type': 'article'
+                            })
                         else:
-                            feedback.append({'word': orig_words[i], 'status': 'missed'})
+                            # Regular mispronunciation
+                            feedback.append({'word': orig_words[i], 'status': 'mispronounced'})
                     else:
+                        # no spoken token at all -> truly missed the word
                         feedback.append({'word': orig_words[i], 'status': 'missed'})
             elif tag == 'delete':
                 for i in range(i1, i2):

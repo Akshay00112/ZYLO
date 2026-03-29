@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+BACKEND/static/uploads/
+static/uploads/
+.env
+.idea/
+.vscode/
